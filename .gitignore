@@ -1,2 +1,5 @@
 .venv/
-cmd/docker-machine-driver-vspheresoyoustart
+bin
+pkg
+src
+dist

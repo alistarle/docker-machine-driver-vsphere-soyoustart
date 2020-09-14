@@ -2,7 +2,7 @@
  * Copyright 2014 VMware, Inc.  All rights reserved.  Licensed under the Apache v2 License.
  */
 
-package dockermachinedrivervspheresoyoustart
+package main
 
 import (
 	"archive/tar"
@@ -16,11 +16,13 @@ import (
 	"time"
 
 	"github.com/docker/machine/libmachine/drivers"
+	"github.com/docker/machine/libmachine/drivers/plugin"
 	"github.com/docker/machine/libmachine/log"
 	"github.com/docker/machine/libmachine/mcnflag"
 	"github.com/docker/machine/libmachine/mcnutils"
 	"github.com/docker/machine/libmachine/ssh"
 	"github.com/docker/machine/libmachine/state"
+	"github.com/ovh/go-ovh/ovh"
 
 	"errors"
 
@@ -28,11 +30,16 @@ import (
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/guest"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/view"
 	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/govmomi/vim25/types"
 	"golang.org/x/net/context"
 )
+
+func main() {
+	plugin.RegisterDriver(NewDriver("", ""))
+}
 
 const (
 	// dockerBridgeIP is the default IP address of the docker0 bridge.
@@ -43,6 +50,13 @@ const (
 	// B2DPass is the guest Pass for tools login
 	B2DPass = "tcuser"
 )
+
+type NetworkConfiguration struct {
+	MacAddress string
+	IPAddress  net.IP
+	Gateway    net.IP
+	Netmask    int
+}
 
 type Driver struct {
 	*drivers.BaseDriver
@@ -66,6 +80,12 @@ type Driver struct {
 	HostSystem string
 	CfgParams  []string
 	CloudInit  string
+
+	Endpoint          string
+	ApplicationKey    string
+	ApplicationSecret string
+	ConsumerKey       string
+	Service           string
 
 	SSHPassword string
 }
@@ -167,6 +187,31 @@ func (d *Driver) GetCreateFlags() []mcnflag.Flag {
 			Name:   "vspheresoyoustart-cloudinit",
 			Usage:  "vSphere cloud-init file or url to set in the guestinfo",
 		},
+		mcnflag.StringFlag{
+			EnvVar: "OVH_ENDPOINT",
+			Name:   "vspheresoyoustart-ovh-endpoint",
+			Usage:  "OVH endpoint",
+		},
+		mcnflag.StringFlag{
+			EnvVar: "OVH_APPLICATION_KEY",
+			Name:   "vspheresoyoustart-ovh-application-key",
+			Usage:  "OVH application key",
+		},
+		mcnflag.StringFlag{
+			EnvVar: "OVH_APPLICATION_SECRET",
+			Name:   "vspheresoyoustart-ovh-application-secret",
+			Usage:  "OVH application secret",
+		},
+		mcnflag.StringFlag{
+			EnvVar: "OVH_CONSUMER_KEY",
+			Name:   "vspheresoyoustart-ovh-consumer-key",
+			Usage:  "OVH consumer key",
+		},
+		mcnflag.StringFlag{
+			EnvVar: "OVH_SERVICE",
+			Name:   "vspheresoyoustart-ovh-service",
+			Usage:  "OVH Service",
+		},
 	}
 }
 
@@ -199,33 +244,38 @@ func (d *Driver) GetSSHUsername() string {
 
 // DriverName returns the name of the driver
 func (d *Driver) DriverName() string {
-	return "vmwarevsphere-soyoustart"
+	return "vspheresoyoustart"
 }
 
 func (d *Driver) SetConfigFromFlags(flags drivers.DriverOptions) error {
 	d.SSHUser = "docker"
 	d.SSHPort = 22
-	d.CPU = flags.Int("vmwarevsphere-cpu-count")
-	d.Memory = flags.Int("vmwarevsphere-memory-size")
-	d.DiskSize = flags.Int("vmwarevsphere-disk-size")
-	d.Boot2DockerURL = flags.String("vmwarevsphere-boot2docker-url")
-	d.IP = flags.String("vmwarevsphere-vcenter")
-	d.Port = flags.Int("vmwarevsphere-vcenter-port")
-	d.Username = flags.String("vmwarevsphere-username")
-	d.Password = flags.String("vmwarevsphere-password")
-	d.Networks = flags.StringSlice("vmwarevsphere-network")
-	d.Datastore = flags.String("vmwarevsphere-datastore")
-	d.Datacenter = flags.String("vmwarevsphere-datacenter")
+	d.CPU = flags.Int("vspheresoyoustart-cpu-count")
+	d.Memory = flags.Int("vspheresoyoustart-memory-size")
+	d.DiskSize = flags.Int("vspheresoyoustart-disk-size")
+	d.Boot2DockerURL = flags.String("vspheresoyoustart-boot2docker-url")
+	d.IP = flags.String("vspheresoyoustart-vcenter")
+	d.Port = flags.Int("vspheresoyoustart-vcenter-port")
+	d.Username = flags.String("vspheresoyoustart-username")
+	d.Password = flags.String("vspheresoyoustart-password")
+	d.Networks = flags.StringSlice("vspheresoyoustart-network")
+	d.Datastore = flags.String("vspheresoyoustart-datastore")
+	d.Datacenter = flags.String("vspheresoyoustart-datacenter")
 	// Sanitize input on ingress.
-	d.Folder = strings.Trim(flags.String("vmwarevsphere-folder"), "/")
-	d.Pool = flags.String("vmwarevsphere-pool")
-	d.HostSystem = flags.String("vmwarevsphere-hostsystem")
-	d.CfgParams = flags.StringSlice("vmwarevsphere-cfgparam")
-	d.CloudInit = flags.String("vmwarevsphere-cloudinit")
+	d.Folder = strings.Trim(flags.String("vspheresoyoustart-folder"), "/")
+	d.Pool = flags.String("vspheresoyoustart-pool")
+	d.HostSystem = flags.String("vspheresoyoustart-hostsystem")
+	d.CfgParams = flags.StringSlice("vspheresoyoustart-cfgparam")
+	d.CloudInit = flags.String("vspheresoyoustart-cloudinit")
 	d.SetSwarmConfigFromFlags(flags)
 
 	d.ISO = d.ResolveStorePath(isoFilename)
 
+	d.Endpoint = flags.String("vspheresoyoustart-ovh-endpoint")
+	d.ApplicationKey = flags.String("vspheresoyoustart-ovh-application-key")
+	d.ApplicationSecret = flags.String("vspheresoyoustart-ovh-application-secret")
+	d.ConsumerKey = flags.String("vspheresoyoustart-ovh-consumer-key")
+	d.Service = flags.String("vspheresoyoustart-ovh-service")
 	return nil
 }
 
@@ -286,6 +336,69 @@ func (d *Driver) GetIP() (string, error) {
 	}
 
 	return "", errors.New("No IP despite waiting for one - check DHCP status")
+}
+
+func (d *Driver) GetNetworkConfiguration() (NetworkConfiguration, error) {
+	log.Infof("Looking for an available mac addres...")
+	var netconf NetworkConfiguration
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	c, err := d.vsphereLogin(ctx)
+	if err != nil {
+		return netconf, err
+	}
+	defer c.Logout(ctx)
+
+	m := view.NewManager(c.Client)
+
+	v, err := m.CreateContainerView(ctx, c.ServiceContent.RootFolder, []string{"VirtualMachine"}, true)
+	if err != nil {
+		return netconf, err
+	}
+
+	defer v.Destroy(ctx)
+
+	var vms []mo.VirtualMachine
+	err = v.Retrieve(ctx, []string{"VirtualMachine"}, []string{"config"}, &vms)
+	if err != nil {
+		return netconf, err
+	}
+
+	var vspheremacs = []string{}
+	for _, vm := range vms {
+		vspheremacs = append(vspheremacs, object.VirtualDeviceList(vm.Config.Hardware.Device).PrimaryMacAddress())
+	}
+
+	client, _ := ovh.NewClient(
+		d.Endpoint,
+		d.ApplicationKey,
+		d.ApplicationSecret,
+		d.ConsumerKey,
+	)
+
+	var virtualMacs = []string{}
+	if err := client.Get(fmt.Sprintf("/dedicated/server/%s/virtualMac", d.Service), &virtualMacs); err != nil {
+		fmt.Printf("Error getting mac addresses: %q\n", err)
+		return netconf, err
+	}
+
+	for _, mac := range virtualMacs {
+		if !Find(vspheremacs, mac) {
+			fmt.Printf("Found available mac: %s\n", mac)
+			var ipAddress = []string{}
+			if err := client.Get(fmt.Sprintf("/dedicated/server/%s/virtualMac/%s/virtualAddress", d.Service, mac), &ipAddress); err != nil {
+				fmt.Printf("Error getting IP address: %q\n", err)
+			}
+			ip := net.ParseIP(ipAddress[0]).To4()
+			fmt.Printf("Found available ip address: %s\n", ip)
+			gateway := net.IP{ip[0], ip[1], ip[2], 254}
+			fmt.Printf("Processed gateway: %s\n", gateway)
+			return NetworkConfiguration{mac, ip, gateway, 24}, err
+		}
+	}
+	fmt.Printf("No mac address available\n")
+	return netconf, errors.New("Couldn't find any free mac address - Create more in SoYouStart admin panel")
 }
 
 func (d *Driver) GetState() (state.State, error) {
@@ -367,7 +480,7 @@ func (d *Driver) PreCreateCheck() error {
 		return err
 	}
 
-	// TODO: if the user has both the VSPHERE_NETWORK defined and adds --vmwarevsphere-network
+	// TODO: if the user has both the VSPHERE_NETWORK defined and adds --vspheresoyoustart-network
 	//       both are used at the same time - probably should detect that and remove the one from ENV
 	if len(d.Networks) == 0 {
 		// machine assumes there will be a network
@@ -572,18 +685,31 @@ func (d *Driver) Create() error {
 
 	add = append(add, devices.InsertIso(cdrom, dss.Path(fmt.Sprintf("%s/%s", d.MachineName, isoFilename))))
 
-	for _, netName := range d.Networks {
+	var opts []types.BaseOptionValue
+	for i, netName := range d.Networks {
 		backing, err := networks[netName].EthernetCardBackingInfo(ctx)
 		if err != nil {
 			return err
 		}
-		log.Infof("Hello Dude, it is my custom log : %s", netName)
+
 		netdev, err := object.EthernetCardTypes().CreateEthernetCard("vmxnet3", backing)
 		if err != nil {
 			return err
 		}
 
-		log.Infof("adding network: %s", netName)
+		netconf, err := d.GetNetworkConfiguration()
+		if err != nil {
+			return err
+		}
+		netdev.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard().AddressType = "MANUAL"
+		netdev.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard().MacAddress = netconf.MacAddress
+
+		opts = append(opts, &types.OptionValue{Key: fmt.Sprintf("guestinfo.interface.%d.mac", i), Value: netconf.MacAddress})
+		opts = append(opts, &types.OptionValue{Key: fmt.Sprintf("guestinfo.interface.%d.dhcp", i), Value: "no"})
+		opts = append(opts, &types.OptionValue{Key: fmt.Sprintf("guestinfo.interface.%d.ip.0.address", i), Value: fmt.Sprintf("%s/%d", netconf.IPAddress, netconf.Netmask)})
+		opts = append(opts, &types.OptionValue{Key: fmt.Sprintf("guestinfo.interface.%d.route.0.gateway", i), Value: netconf.Gateway.String()})
+
+		log.Infof("Adding network with static mac address: %s", netName)
 		add = append(add, netdev)
 	}
 
@@ -593,7 +719,6 @@ func (d *Driver) Create() error {
 	}
 
 	// Adding some guestinfo data
-	var opts []types.BaseOptionValue
 	for _, param := range d.CfgParams {
 		v := strings.SplitN(param, "=", 2)
 		key := v[0]
@@ -1037,4 +1162,13 @@ func (f *FileAttrFlag) SetPerms(owner, group, perms int) {
 
 func (f *FileAttrFlag) Attr() types.BaseGuestFileAttributes {
 	return &f.GuestPosixFileAttributes
+}
+
+func Find(slice []string, val string) bool {
+	for _, item := range slice {
+		if item == val {
+			return true
+		}
+	}
+	return false
 }
